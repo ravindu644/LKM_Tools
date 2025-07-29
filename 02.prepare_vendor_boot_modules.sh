@@ -6,6 +6,7 @@
 #
 #   This script prepares vendor_boot modules with intelligent dependency
 #   resolution and load order optimization for Android GKI kernels.
+#   It supports both interactive and non-interactive modes.
 #
 #   Workflow:
 #   1. Copy modules from master list (modules_list.txt)
@@ -45,6 +46,32 @@ log_error() {
     echo "[ERROR] $1"
 }
 
+show_help() {
+    echo "Usage: $0 [OPTIONS] [ARGUMENTS...]"
+    echo ""
+    echo "This script prepares a vendor_boot module set with dependency resolution and stripping."
+    echo ""
+    echo "Modes of Operation:"
+    echo "  1. Interactive Mode: Run without any arguments to be prompted for each path."
+    echo "     $0"
+    echo ""
+    echo "  2. Non-Interactive (Argument) Mode: Provide all 6 paths as arguments."
+    echo "     $0 <modules_list> <staging_dir> <oem_load_file> <system_map> <strip_tool> <output_dir>"
+    echo ""
+    echo "Arguments:"
+    echo "  <modules_list>      Path to modules_list.txt (from previous script)"
+    echo "  <staging_dir>       Path to kernel build staging directory"
+    echo "  <oem_load_file>     Path to OEM vendor_boot.modules.load file"
+    echo "  <system_map>        Path to System.map file"
+    echo "  <strip_tool>        Path to LLVM strip tool (e.g., .../bin/llvm-strip)"
+    echo "  <output_dir>        Output directory for the final modules"
+    echo ""
+    echo "Options:"
+    echo "  -h, --help          Show this help message and exit."
+    echo ""
+}
+
+
 find_module_in_staging() {
     local module_name="$1"
     local staging_dir="$2"
@@ -54,37 +81,37 @@ find_module_in_staging() {
 strip_modules() {
     local module_dir="$1"
     local strip_tool="$2"
-    
+
     if [ ! -x "$strip_tool" ]; then
         log_warning "LLVM strip tool not found or not executable: $strip_tool"
         log_warning "Skipping module stripping..."
         return 1
     fi
-    
+
     log_info "Stripping modules to reduce size..."
-    
+
     local stripped_count=0
     local total_size_before=0
     local total_size_after=0
-    
+
     for module in "$module_dir"/*.ko; do
         [ -f "$module" ] || continue
         size_before=$(stat -f%z "$module" 2>/dev/null || stat -c%s "$module" 2>/dev/null || echo "0")
         total_size_before=$((total_size_before + size_before))
     done
-    
+
     for module in "$module_dir"/*.ko; do
         [ -f "$module" ] || continue
-        
+
         module_name=$(basename "$module")
         size_before=$(stat -f%z "$module" 2>/dev/null || stat -c%s "$module" 2>/dev/null || echo "0")
-        
+
         "$strip_tool" --strip-debug --strip-unneeded "$module" 2>/dev/null
-        
+
         if [ $? -eq 0 ]; then
             size_after=$(stat -f%z "$module" 2>/dev/null || stat -c%s "$module" 2>/dev/null || echo "0")
             total_size_after=$((total_size_after + size_after))
-            
+
             if [ "$size_before" -gt "$size_after" ]; then
                 reduction=$((size_before - size_after))
                 log_info "  ✓ Stripped $module_name: ${size_before} → ${size_after} bytes (-${reduction} bytes)"
@@ -98,66 +125,90 @@ strip_modules() {
             total_size_after=$((total_size_after + size_after))
         fi
     done
-    
+
     if [ $stripped_count -gt 0 ]; then
         total_reduction=$((total_size_before - total_size_after))
         log_info "Strip complete: $stripped_count modules processed"
         log_info "Total size reduction: $total_reduction bytes ($(echo "scale=1; $total_reduction / 1024" | bc 2>/dev/null || echo "$total_reduction/1024")KB)"
     fi
-    
+
     return 0
 }
 
 # --- Main Script ---
 
+# --- Argument Parsing ---
+if [[ "$1" == "-h" || "$1" == "--help" ]]; then
+    show_help
+    exit 0
+fi
+
 print_header "Vendor Boot Modules Preparation Script"
 
-echo "This script prepares a complete vendor_boot module set with intelligent"
-echo "dependency resolution, LLVM stripping, and load order optimization."
-echo ""
+# --- Input Collection ---
 
-read -e -p "Enter path to modules_list.txt (from previous script): " MODULES_LIST_RAW
+# Non-Interactive (Argument) Mode
+if [ "$#" -eq 6 ]; then
+    log_info "Running in Non-Interactive Mode."
+    MODULES_LIST_RAW="$1"
+    STAGING_DIR_RAW="$2"
+    OEM_LOAD_FILE_RAW="$3"
+    SYSTEM_MAP_RAW="$4"
+    STRIP_TOOL_RAW="$5"
+    OUTPUT_DIR_RAW="$6"
+
+# Interactive Mode
+elif [ "$#" -eq 0 ]; then
+    log_info "Running in Interactive Mode."
+    echo "This script prepares a complete vendor_boot module set."
+    echo ""
+    read -e -p "Enter path to modules_list.txt (from previous script): " MODULES_LIST_RAW
+    read -e -p "Enter path to kernel build staging directory: " STAGING_DIR_RAW
+    read -e -p "Enter path to OEM vendor_boot.modules.load file: " OEM_LOAD_FILE_RAW
+    read -e -p "Enter path to System.map file: " SYSTEM_MAP_RAW
+    read -e -p "Enter path to LLVM strip tool (e.g., clang-rXXXXXX/bin/llvm-strip): " STRIP_TOOL_RAW
+    read -e -p "Enter output directory for vendor_boot modules: " OUTPUT_DIR_RAW
+
+# Invalid arguments
+else
+    log_error "Invalid number of arguments. Use 0 for interactive mode or 6 for non-interactive."
+    show_help
+    exit 1
+fi
+
+print_header "Setup and Validation"
+
+# --- Input Sanitize and Validation ---
 MODULES_LIST=$(sanitize_path "$MODULES_LIST_RAW")
+STAGING_DIR=$(sanitize_path "$STAGING_DIR_RAW")
+OEM_LOAD_FILE=$(sanitize_path "$OEM_LOAD_FILE_RAW")
+SYSTEM_MAP=$(sanitize_path "$SYSTEM_MAP_RAW")
+STRIP_TOOL=$(sanitize_path "$STRIP_TOOL_RAW")
+OUTPUT_DIR=$(sanitize_path "$OUTPUT_DIR_RAW")
+
 if [ ! -f "$MODULES_LIST" ]; then
     log_error "modules_list.txt not found at: '$MODULES_LIST'"
     exit 1
 fi
-
-read -e -p "Enter path to kernel build staging directory: " STAGING_DIR_RAW
-STAGING_DIR=$(sanitize_path "$STAGING_DIR_RAW")
 if [ ! -d "$STAGING_DIR" ]; then
     log_error "Staging directory not found: '$STAGING_DIR'"
     exit 1
 fi
-
-read -e -p "Enter path to OEM vendor_boot.modules.load file: " OEM_LOAD_FILE_RAW
-OEM_LOAD_FILE=$(sanitize_path "$OEM_LOAD_FILE_RAW")
 if [ ! -f "$OEM_LOAD_FILE" ]; then
     log_error "OEM modules.load file not found: '$OEM_LOAD_FILE'"
     exit 1
 fi
-
-read -e -p "Enter path to System.map file: " SYSTEM_MAP_RAW
-SYSTEM_MAP=$(sanitize_path "$SYSTEM_MAP_RAW")
 if [ ! -f "$SYSTEM_MAP" ]; then
     log_error "System.map file not found: '$SYSTEM_MAP'"
     exit 1
 fi
-
-read -e -p "Enter path to LLVM strip tool (e.g., clang-rXXXXXX/bin/llvm-strip): " STRIP_TOOL_RAW
-STRIP_TOOL=$(sanitize_path "$STRIP_TOOL_RAW")
-if [ ! -x "$STRIP_TOOL" ]; then
-    log_warning "LLVM strip tool not found or not executable: '$STRIP_TOOL'"
-    log_warning "Module stripping will be skipped."
+if [ -n "$STRIP_TOOL" ] && [ ! -x "$STRIP_TOOL" ]; then
+    log_warning "LLVM strip tool not found or not executable: '$STRIP_TOOL'. Module stripping will be skipped."
+    STRIP_TOOL=""
 fi
-
-read -e -p "Enter output directory for vendor_boot modules: " OUTPUT_DIR_RAW
-OUTPUT_DIR=$(sanitize_path "$OUTPUT_DIR_RAW")
 if [ -z "$OUTPUT_DIR" ]; then
     OUTPUT_DIR="$(pwd)/vendor_boot_modules"
 fi
-
-print_header "Setup and Validation"
 
 log_info "Creating clean output directory: $OUTPUT_DIR"
 rm -rf "$OUTPUT_DIR"
@@ -177,7 +228,6 @@ if [ -z "$KERNEL_VERSION" ]; then
     log_error "Could not determine kernel version from modules"
     exit 1
 fi
-
 log_info "Detected kernel version: $KERNEL_VERSION"
 
 MODULE_WORK_DIR="$WORK_DIR/lib/modules/$KERNEL_VERSION"
@@ -187,18 +237,16 @@ print_header "Copying Initial Module Set"
 
 INITIAL_COUNT=0
 MISSING_MODULES=()
-
 log_info "Processing modules from list..."
 
 while IFS= read -r module_name || [ -n "$module_name" ]; do
     [ -z "$module_name" ] && continue
     module_name=$(echo "$module_name" | tr -d '\r\n' | xargs)
     [ -z "$module_name" ] && continue
-    
+
     log_info "Looking for: $module_name"
-    
     module_path=$(find_module_in_staging "$module_name" "$STAGING_DIR")
-    
+
     if [ -n "$module_path" ] && [ -f "$module_path" ]; then
         cp "$module_path" "$MODULE_WORK_DIR/"
         if [ $? -eq 0 ]; then
@@ -214,7 +262,6 @@ while IFS= read -r module_name || [ -n "$module_name" ]; do
 done < "$MODULES_LIST"
 
 log_info "Copied $INITIAL_COUNT modules from initial list"
-
 if [ ${#MISSING_MODULES[@]} -gt 0 ]; then
     log_warning "Missing ${#MISSING_MODULES[@]} modules from staging directory"
     echo "Missing modules: ${MISSING_MODULES[*]}"
@@ -223,10 +270,8 @@ fi
 print_header "Resolving Dependencies"
 
 log_info "Starting iterative dependency resolution..."
-
 PROCESSED_MODULES_FILE="$WORK_DIR/processed_modules.list"
 touch "$PROCESSED_MODULES_FILE"
-
 PROCESSING_QUEUE_FILE="$WORK_DIR/processing_queue.list"
 find "$MODULE_WORK_DIR" -name "*.ko" -printf "%f\n" > "$PROCESSING_QUEUE_FILE"
 
@@ -234,43 +279,31 @@ ITERATION=0
 while [ -s "$PROCESSING_QUEUE_FILE" ]; do
     ((ITERATION++))
     log_info "Dependency resolution iteration $ITERATION"
-    
     NEW_QUEUE_FILE="$WORK_DIR/new_queue_$ITERATION.list"
     touch "$NEW_QUEUE_FILE"
-    
     NEW_DEPS_FOUND=0
-    
+
     while IFS= read -r module_name || [ -n "$module_name" ]; do
         [ -z "$module_name" ] && continue
-        
         if grep -Fxq "$module_name" "$PROCESSED_MODULES_FILE" 2>/dev/null; then
             continue
         fi
-        
         module_path="$MODULE_WORK_DIR/$module_name"
         if [ ! -f "$module_path" ]; then
             log_warning "Module file not found during processing: $module_name"
             continue
         fi
-        
         log_info "Processing dependencies for: $module_name"
-        
         deps=$(modinfo -F depends "$module_path" 2>/dev/null | tr ',' '\n' | grep -v '^$' || true)
-        
         if [ -n "$deps" ]; then
             log_info "  Dependencies found: $(echo "$deps" | tr '\n' ' ')"
-            
             while IFS= read -r dep_name || [ -n "$dep_name" ]; do
                 [ -z "$dep_name" ] && continue
-                
                 dep_ko_name="${dep_name}.ko"
-                
                 if [ -f "$MODULE_WORK_DIR/$dep_ko_name" ]; then
                     continue
                 fi
-                
                 dep_path=$(find_module_in_staging "$dep_ko_name" "$STAGING_DIR")
-                
                 if [ -n "$dep_path" ] && [ -f "$dep_path" ]; then
                     log_info "  ✓ Adding missing dependency: $dep_ko_name"
                     cp "$dep_path" "$MODULE_WORK_DIR/"
@@ -285,20 +318,15 @@ while [ -s "$PROCESSING_QUEUE_FILE" ]; do
         else
             log_info "  No dependencies found"
         fi
-        
         echo "$module_name" >> "$PROCESSED_MODULES_FILE"
-        
     done < "$PROCESSING_QUEUE_FILE"
-    
+
     log_info "Iteration $ITERATION complete - Added $NEW_DEPS_FOUND new dependencies"
-    
     mv "$NEW_QUEUE_FILE" "$PROCESSING_QUEUE_FILE"
-    
     if [ $ITERATION -gt 10 ]; then
         log_warning "Maximum iterations reached, stopping dependency resolution"
         break
     fi
-    
     if [ $NEW_DEPS_FOUND -eq 0 ]; then
         log_info "No new dependencies found, resolution complete"
         break
@@ -309,29 +337,20 @@ FINAL_MODULE_COUNT=$(find "$MODULE_WORK_DIR" -name "*.ko" | wc -l)
 log_info "Dependency resolution complete - Final module count: $FINAL_MODULE_COUNT"
 
 print_header "Stripping Modules"
-
-if [ -x "$STRIP_TOOL" ]; then
+if [ -n "$STRIP_TOOL" ]; then
     strip_modules "$MODULE_WORK_DIR" "$STRIP_TOOL"
 else
     log_warning "Skipping module stripping - LLVM strip tool not available"
 fi
 
 print_header "Preparing Build Environment"
-
-STAGING_MODULES_DIR=$(find "$STAGING_DIR" -type d -name "modules" -path "*/lib/modules/*" | head -1)
-if [ -n "$STAGING_MODULES_DIR" ]; then
-    STAGING_KERNEL_DIR=$(dirname "$STAGING_MODULES_DIR")
-    
-    for file in modules.builtin modules.builtin.modinfo; do
-        if [ -f "$STAGING_KERNEL_DIR/$file" ]; then
-            log_info "Copying $file from staging"
-            cp "$STAGING_KERNEL_DIR/$file" "$MODULE_WORK_DIR/"
-        fi
-    done
+STAGING_MODULES_DIR=$(dirname "$(find "$STAGING_DIR" -type f -name "modules.builtin" -path "*/lib/modules/*" | head -1)")
+if [ -d "$STAGING_MODULES_DIR" ]; then
+    log_info "Copying build files from $STAGING_MODULES_DIR"
+    cp "$STAGING_MODULES_DIR"/modules.* "$MODULE_WORK_DIR/" 2>/dev/null
 fi
 
 print_header "Generating Module Dependencies"
-
 log_info "Running depmod to generate new modules.dep..."
 cd "$WORK_DIR"
 depmod -b . -F "$SYSTEM_MAP" "$KERNEL_VERSION"
@@ -341,20 +360,13 @@ if [ $? -ne 0 ]; then
 fi
 log_info "Module dependencies generated successfully"
 
-# --- modules.load: OEM Copy Only ---
-
 print_header "Using OEM modules.load (No Modifications)"
-
-log_info "Using OEM modules.load without adding or removing entries"
-
+log_info "Copying OEM modules.load without adding or removing entries"
 cp "$OEM_LOAD_FILE" "$MODULE_WORK_DIR/modules.load"
-
-log_info "modules.load copied directly from OEM without changes"
+log_info "modules.load copied directly"
 
 print_header "Finalizing Output"
-
 log_info "Copying final module set to: $OUTPUT_DIR"
-
 cp "$MODULE_WORK_DIR"/*.ko "$OUTPUT_DIR/" 2>/dev/null || true
 cp "$MODULE_WORK_DIR"/modules.* "$OUTPUT_DIR/" 2>/dev/null || true
 
@@ -362,15 +374,14 @@ FINAL_COUNT=$(ls -1 "$OUTPUT_DIR"/*.ko 2>/dev/null | wc -l)
 LOAD_COUNT=$(wc -l < "$OUTPUT_DIR/modules.load" 2>/dev/null || echo "0")
 
 print_header "Process Complete!"
-
 echo "Vendor boot module preparation successful!"
 echo ""
 echo "Results:"
-echo "  - Total modules: $FINAL_COUNT"
-echo "  - Load order entries: $LOAD_COUNT"
-echo "  - Output directory: $OUTPUT_DIR"
+echo "  - Total final modules: $FINAL_COUNT"
+echo "  - Load order entries:  $LOAD_COUNT"
+echo "  - Output directory:      $OUTPUT_DIR"
 echo ""
-echo "Files created:"
-ls -la "$OUTPUT_DIR" 2>/dev/null || echo "No files found in output directory"
+echo "Files created in $OUTPUT_DIR:"
+ls -lA "$OUTPUT_DIR" 2>/dev/null || echo "No files found in output directory"
 echo ""
 echo "Your vendor_boot module set is ready for packaging!"
