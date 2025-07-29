@@ -137,3 +137,13 @@ Provide all paths as arguments. To skip an optional path (like the NetHunter dir
 ```
 
 **Note:** You should manually copy all the "suspected" modules that were generated but are not present in your OEM's module list to a separate folder (for example, `ath9k_htc.ko` might have been generated because you enabled an Atheros driver as an LKM, etc.).
+
+
+Eg (Only needed for the first time of generating modules.dep and modules.load file):
+
+```bash
+ravindu644@ubuntu:~/Desktop/Kernels/android_kernel_a166p/nethunter (stable-connectivity)$ ls
+
+ath6kl_core.ko  ath9k_common.ko  ath9k_hw.ko  carl9170.ko  mac80211.ko  rndis_host.ko  rt2500usb.ko  rt2800usb.ko  rt2x00usb.ko  rtl8187.ko   zd1201.ko
+ath6kl_usb.ko   ath9k_htc.ko     ath.ko       cfg80211.ko  mt7601u.ko   rndis_wlan.ko  rt2800lib.ko  rt2x00lib.ko  rt73usb.ko    rtl8xxxu.ko  zd1211rw.ko
+```
