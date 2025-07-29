@@ -10,9 +10,10 @@
 #   Workflow:
 #   1. Copy modules from master list (modules_list.txt)
 #   2. Iteratively resolve all dependencies from staging directory
-#   3. Generate updated modules.dep with depmod
-#   4. Intelligently update modules.load with proper ordering
-#   5. Create complete vendor_boot module set
+#   3. Strip modules using LLVM strip to reduce size
+#   4. Generate updated modules.dep with depmod
+#   5. Intelligently update modules.load with proper ordering
+#   6. Create complete vendor_boot module set
 #
 #                              - ravindu644
 # ==============================================================================
@@ -51,12 +52,72 @@ find_module_in_staging() {
     find "$staging_dir" -name "$module_name" -type f -print -quit 2>/dev/null
 }
 
+# Function to strip modules using LLVM strip
+strip_modules() {
+    local module_dir="$1"
+    local strip_tool="$2"
+    
+    if [ ! -x "$strip_tool" ]; then
+        log_warning "LLVM strip tool not found or not executable: $strip_tool"
+        log_warning "Skipping module stripping..."
+        return 1
+    fi
+    
+    log_info "Stripping modules to reduce size..."
+    
+    local stripped_count=0
+    local total_size_before=0
+    local total_size_after=0
+    
+    # Calculate total size before stripping
+    for module in "$module_dir"/*.ko; do
+        [ -f "$module" ] || continue
+        size_before=$(stat -f%z "$module" 2>/dev/null || stat -c%s "$module" 2>/dev/null || echo "0")
+        total_size_before=$((total_size_before + size_before))
+    done
+    
+    for module in "$module_dir"/*.ko; do
+        [ -f "$module" ] || continue
+        
+        module_name=$(basename "$module")
+        size_before=$(stat -f%z "$module" 2>/dev/null || stat -c%s "$module" 2>/dev/null || echo "0")
+        
+        # Strip the module
+        "$strip_tool" --strip-debug --strip-unneeded "$module" 2>/dev/null
+        
+        if [ $? -eq 0 ]; then
+            size_after=$(stat -f%z "$module" 2>/dev/null || stat -c%s "$module" 2>/dev/null || echo "0")
+            total_size_after=$((total_size_after + size_after))
+            
+            if [ "$size_before" -gt "$size_after" ]; then
+                reduction=$((size_before - size_after))
+                log_info "  ✓ Stripped $module_name: ${size_before} → ${size_after} bytes (-${reduction} bytes)"
+            else
+                log_info "  ✓ Processed $module_name: ${size_after} bytes (no reduction)"
+            fi
+            ((stripped_count++))
+        else
+            log_warning "  ✗ Failed to strip $module_name"
+            size_after=$(stat -f%z "$module" 2>/dev/null || stat -c%s "$module" 2>/dev/null || echo "0")
+            total_size_after=$((total_size_after + size_after))
+        fi
+    done
+    
+    if [ $stripped_count -gt 0 ]; then
+        total_reduction=$((total_size_before - total_size_after))
+        log_info "Strip complete: $stripped_count modules processed"
+        log_info "Total size reduction: $total_reduction bytes ($(echo "scale=1; $total_reduction / 1024" | bc 2>/dev/null || echo "$total_reduction/1024")KB)"
+    fi
+    
+    return 0
+}
+
 # --- Main Script ---
 
 print_header "Vendor Boot Modules Preparation Script"
 
 echo "This script prepares a complete vendor_boot module set with intelligent"
-echo "dependency resolution and load order optimization."
+echo "dependency resolution, LLVM stripping, and load order optimization."
 echo ""
 
 # --- Input Collection ---
@@ -91,6 +152,14 @@ SYSTEM_MAP=$(sanitize_path "$SYSTEM_MAP_RAW")
 if [ ! -f "$SYSTEM_MAP" ]; then
     log_error "System.map file not found: '$SYSTEM_MAP'"
     exit 1
+fi
+
+# Get LLVM strip tool path
+read -e -p "Enter path to LLVM strip tool (e.g., clang-rXXXXXX/bin/llvm-strip): " STRIP_TOOL_RAW
+STRIP_TOOL=$(sanitize_path "$STRIP_TOOL_RAW")
+if [ ! -x "$STRIP_TOOL" ]; then
+    log_warning "LLVM strip tool not found or not executable: '$STRIP_TOOL'"
+    log_warning "Module stripping will be skipped."
 fi
 
 # Get output directory
@@ -273,6 +342,16 @@ done
 
 FINAL_MODULE_COUNT=$(find "$MODULE_WORK_DIR" -name "*.ko" | wc -l)
 log_info "Dependency resolution complete - Final module count: $FINAL_MODULE_COUNT"
+
+# --- Strip Modules ---
+
+print_header "Stripping Modules"
+
+if [ -x "$STRIP_TOOL" ]; then
+    strip_modules "$MODULE_WORK_DIR" "$STRIP_TOOL"
+else
+    log_warning "Skipping module stripping - LLVM strip tool not available"
+fi
 
 # --- Copy Required Build Files ---
 
