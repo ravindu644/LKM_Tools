@@ -273,7 +273,7 @@ elif [ "$#" -eq 0 ]; then
     echo ""
     read -e -p "Enter path to NetHunter modules directory: " NH_MODULE_DIR_RAW
     read -e -p "Enter path to kernel build staging directory: " STAGING_DIR_RAW
-    read -e -p "Enter path to vendor_boot.img's modules_list.txt: " VENDOR_BOOT_LIST_RAW
+    read -e -p "Enter path to vendor_boot.img's modules_list.txt (or press Enter to skip separation): " VENDOR_BOOT_LIST_RAW
     read -e -p "Enter path to System.map file: " SYSTEM_MAP_RAW
     read -e -p "Enter output directory for organized modules: " OUTPUT_DIR_RAW
     read -e -p "Enter path to strip tool (llvm-strip/aarch64-linux-gnu-strip) or press Enter to skip: " STRIP_TOOL_RAW
@@ -304,7 +304,12 @@ if [ ! -d "$STAGING_DIR" ]; then
     exit 1
 fi
 
-if [ ! -f "$VENDOR_BOOT_LIST" ]; then
+# Handle vendor_boot list - can be empty to skip separation
+SKIP_VENDOR_BOOT_SEPARATION=false
+if [ -z "$VENDOR_BOOT_LIST" ]; then
+    SKIP_VENDOR_BOOT_SEPARATION=true
+    log_info "Vendor boot modules list not provided - will place all modules in vendor_dlkm only"
+elif [ ! -f "$VENDOR_BOOT_LIST" ]; then
     log_error "Vendor boot modules list not found: '$VENDOR_BOOT_LIST'"
     exit 1
 fi
@@ -335,8 +340,12 @@ print_header "Setup and Validation"
 # Create clean output directory structure
 log_info "Creating output directory structure..."
 rm -rf "$OUTPUT_DIR"
-mkdir -p "$OUTPUT_DIR/vendor_boot"
+if [ "$SKIP_VENDOR_BOOT_SEPARATION" = false ]; then
+    mkdir -p "$OUTPUT_DIR/vendor_boot"
+    log_info "Created vendor_boot directory"
+fi
 mkdir -p "$OUTPUT_DIR/vendor_dlkm"
+log_info "Created vendor_dlkm directory"
 
 # Create temporary work directories
 WORK_DIR=$(mktemp -d)
@@ -361,9 +370,11 @@ fi
 log_info "Detected kernel version: $KERNEL_VERSION"
 
 # Setup module directory structures
-VB_MODULE_DIR="$OUTPUT_DIR/vendor_boot/lib/modules/$KERNEL_VERSION"
+if [ "$SKIP_VENDOR_BOOT_SEPARATION" = false ]; then
+    VB_MODULE_DIR="$OUTPUT_DIR/vendor_boot/lib/modules/$KERNEL_VERSION"
+    mkdir -p "$VB_MODULE_DIR"
+fi
 VD_MODULE_DIR="$OUTPUT_DIR/vendor_dlkm/lib/modules/$KERNEL_VERSION"
-mkdir -p "$VB_MODULE_DIR"
 mkdir -p "$VD_MODULE_DIR"
 
 # --- NetHunter Module Collection ---
@@ -441,48 +452,68 @@ log_info "Total modules required: $TOTAL_MODULES (NetHunter + dependencies)"
 
 # --- Module Organization ---
 
-print_header "Organizing Modules into vendor_boot and vendor_dlkm"
+print_header "Organizing Modules into Output Directories"
 
-# Read vendor_boot modules list into array for faster lookup
-declare -A VENDOR_BOOT_MODULES
-while IFS= read -r module_name || [ -n "$module_name" ]; do
-    [ -z "$module_name" ] && continue
-    module_name=$(echo "$module_name" | tr -d '\r\n' | xargs)
-    [ -z "$module_name" ] && continue
-    VENDOR_BOOT_MODULES["$module_name"]=1
-done < "$VENDOR_BOOT_LIST"
-
-VB_COUNT=0
-VD_COUNT=0
-
-# Organize modules
-for module_name in "${ALL_REQUIRED_MODULES[@]}"; do
-    module_path="$ALL_DEPS_DIR/$module_name"
-    [ -f "$module_path" ] || continue
+if [ "$SKIP_VENDOR_BOOT_SEPARATION" = true ]; then
+    log_info "Vendor boot separation skipped - placing all modules in vendor_dlkm"
     
-    if [[ -n "${VENDOR_BOOT_MODULES[$module_name]}" ]]; then
-        # Module should go to vendor_boot
-        cp "$module_path" "$VB_MODULE_DIR/"
-        ((VB_COUNT++))
-        log_info "→ vendor_boot: $module_name"
-    else
-        # Module should go to vendor_dlkm
+    # Copy all modules to vendor_dlkm
+    for module_name in "${ALL_REQUIRED_MODULES[@]}"; do
+        module_path="$ALL_DEPS_DIR/$module_name"
+        [ -f "$module_path" ] || continue
+        
         cp "$module_path" "$VD_MODULE_DIR/"
         ((VD_COUNT++))
         log_info "→ vendor_dlkm: $module_name"
-    fi
-done
+    done
+    
+    VB_COUNT=0
+    log_info "All $VD_COUNT modules placed in vendor_dlkm"
+    
+else
+    log_info "Organizing modules based on vendor_boot modules list"
+    
+    # Read vendor_boot modules list into array for faster lookup
+    declare -A VENDOR_BOOT_MODULES
+    while IFS= read -r module_name || [ -n "$module_name" ]; do
+        [ -z "$module_name" ] && continue
+        module_name=$(echo "$module_name" | tr -d '\r\n' | xargs)
+        [ -z "$module_name" ] && continue
+        VENDOR_BOOT_MODULES["$module_name"]=1
+    done < "$VENDOR_BOOT_LIST"
 
-log_info "Organized $VB_COUNT modules into vendor_boot"
-log_info "Organized $VD_COUNT modules into vendor_dlkm"
+    VB_COUNT=0
+    VD_COUNT=0
+
+    # Organize modules
+    for module_name in "${ALL_REQUIRED_MODULES[@]}"; do
+        module_path="$ALL_DEPS_DIR/$module_name"
+        [ -f "$module_path" ] || continue
+        
+        if [[ -n "${VENDOR_BOOT_MODULES[$module_name]}" ]]; then
+            # Module should go to vendor_boot
+            cp "$module_path" "$VB_MODULE_DIR/"
+            ((VB_COUNT++))
+            log_info "→ vendor_boot: $module_name"
+        else
+            # Module should go to vendor_dlkm
+            cp "$module_path" "$VD_MODULE_DIR/"
+            ((VD_COUNT++))
+            log_info "→ vendor_dlkm: $module_name"
+        fi
+    done
+
+    log_info "Organized $VB_COUNT modules into vendor_boot"
+    log_info "Organized $VD_COUNT modules into vendor_dlkm"
+fi
 
 # --- Module Stripping ---
 
 if [ -n "$STRIP_TOOL" ]; then
     print_header "Stripping Modules"
     
-    # Strip vendor_boot modules if any
-    if [ $VB_COUNT -gt 0 ]; then
+    # Strip vendor_boot modules if any and not skipped
+    if [ "$SKIP_VENDOR_BOOT_SEPARATION" = false ] && [ $VB_COUNT -gt 0 ]; then
         strip_modules "$VB_MODULE_DIR" "$STRIP_TOOL"
     fi
     
@@ -504,8 +535,8 @@ STAGING_MODULES_DIR=$(dirname "$(find "$STAGING_DIR" -type f -name "modules.buil
 if [ -d "$STAGING_MODULES_DIR" ]; then
     log_info "Copying build files from staging..."
     
-    # Copy to vendor_boot if it has modules
-    if [ $VB_COUNT -gt 0 ]; then
+    # Copy to vendor_boot if it exists and has modules
+    if [ "$SKIP_VENDOR_BOOT_SEPARATION" = false ] && [ $VB_COUNT -gt 0 ]; then
         cp "$STAGING_MODULES_DIR"/modules.* "$VB_MODULE_DIR/" 2>/dev/null
         log_info "✓ Build files copied to vendor_boot"
     fi
@@ -567,7 +598,7 @@ generate_module_files() {
 }
 
 # Generate files for vendor_boot
-if [ $VB_COUNT -gt 0 ]; then
+if [ "$SKIP_VENDOR_BOOT_SEPARATION" = false ] && [ $VB_COUNT -gt 0 ]; then
     generate_module_files "$OUTPUT_DIR/vendor_boot" "vendor_boot"
 fi
 
@@ -587,11 +618,12 @@ echo "  - NetHunter modules found: $NH_COUNT"
 echo "  - Total modules processed: $TOTAL_MODULES"
 echo "  - vendor_boot modules: $VB_COUNT"
 echo "  - vendor_dlkm modules: $VD_COUNT"
+echo "  - Vendor boot separation: $([ "$SKIP_VENDOR_BOOT_SEPARATION" = true ] && echo "Skipped" || echo "Enabled")"
 echo "  - Strip tool used: $([ -n "$STRIP_TOOL" ] && echo "$(basename "$STRIP_TOOL")" || echo "None")"
 echo "  - Output directory: $OUTPUT_DIR"
 echo ""
 
-if [ $VB_COUNT -gt 0 ]; then
+if [ "$SKIP_VENDOR_BOOT_SEPARATION" = false ] && [ $VB_COUNT -gt 0 ]; then
     echo "vendor_boot contents:"
     ls -la "$OUTPUT_DIR/vendor_boot/lib/modules/$KERNEL_VERSION/" 2>/dev/null || echo "  (no files)"
     echo ""
