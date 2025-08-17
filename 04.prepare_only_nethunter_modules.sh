@@ -54,8 +54,8 @@ show_help() {
     echo "  1. Interactive Mode: Run without any arguments to be prompted for each path."
     echo "     $0"
     echo ""
-    echo "  2. Non-Interactive (Argument) Mode: Provide all 5 paths as arguments."
-    echo "     $0 <nh_modules_dir> <staging_dir> <vendor_boot_list> <system_map> <output_dir>"
+    echo "  2. Non-Interactive (Argument) Mode: Provide all 5-6 paths as arguments."
+    echo "     $0 <nh_modules_dir> <staging_dir> <vendor_boot_list> <system_map> <output_dir> [strip_tool]"
     echo ""
     echo "Arguments:"
     echo "  <nh_modules_dir>    Directory containing suspected NetHunter modules"
@@ -63,6 +63,8 @@ show_help() {
     echo "  <vendor_boot_list>  Path to vendor_boot.img's modules_list.txt"
     echo "  <system_map>        Path to System.map file for depmod"
     echo "  <output_dir>        Output directory for organized modules"
+    echo "  [strip_tool]        (Optional) Path to strip tool (llvm-strip or aarch64-linux-gnu-strip)"
+    echo "                      Leave empty or provide \"\" to skip stripping"
     echo ""
     echo "Options:"
     echo "  -h, --help          Show this help message and exit."
@@ -73,7 +75,7 @@ show_help() {
     echo "    └── vendor_dlkm/     - NetHunter modules + other dependencies"
     echo ""
     echo "Each folder will contain:"
-    echo "  - *.ko files"
+    echo "  - *.ko files (stripped if tool provided)"
     echo "  - modules.dep"
     echo "  - modules.load"
     echo "  - modules.order"
@@ -184,6 +186,64 @@ generate_load_order_from_deps() {
     rm -f "$temp_deps" "$processed"
 }
 
+# Function to strip modules using strip tool
+strip_modules() {
+    local module_dir="$1"
+    local strip_tool="$2"
+
+    if [ -z "$strip_tool" ] || [ ! -x "$strip_tool" ]; then
+        log_warning "Strip tool not available, skipping module stripping..."
+        return 1
+    fi
+
+    log_info "Stripping modules in $(basename "$module_dir") to reduce size..."
+
+    local stripped_count=0
+    local failed_count=0
+    local total_size_before=0
+    local total_size_after=0
+
+    # Calculate total size before stripping
+    for module in "$module_dir"/*.ko; do
+        [ -f "$module" ] || continue
+        size_before=$(stat -f%z "$module" 2>/dev/null || stat -c%s "$module" 2>/dev/null || echo "0")
+        total_size_before=$((total_size_before + size_before))
+    done
+
+    for module in "$module_dir"/*.ko; do
+        [ -f "$module" ] || continue
+
+        module_name=$(basename "$module")
+
+        # Strip the module (remove debug info and unneeded symbols)
+        "$strip_tool" --strip-debug --strip-unneeded "$module" 2>/dev/null
+
+        if [ $? -eq 0 ]; then
+            ((stripped_count++))
+            log_info "  ✓ Stripped: $module_name"
+        else
+            ((failed_count++))
+            log_warning "  ✗ Failed to strip: $module_name"
+        fi
+    done
+
+    # Calculate total size after stripping
+    for module in "$module_dir"/*.ko; do
+        [ -f "$module" ] || continue
+        size_after=$(stat -f%z "$module" 2>/dev/null || stat -c%s "$module" 2>/dev/null || echo "0")
+        total_size_after=$((total_size_after + size_after))
+    done
+
+    if [ $stripped_count -gt 0 ]; then
+        total_reduction=$((total_size_before - total_size_after))
+        reduction_kb=$((total_reduction / 1024))
+        log_info "Strip complete: $stripped_count modules stripped, $failed_count failed"
+        log_info "Total size reduction: $total_reduction bytes (${reduction_kb}KB)"
+    fi
+
+    return 0
+}
+
 # --- Argument Validation ---
 
 if [[ "$1" == "-h" || "$1" == "--help" ]]; then
@@ -196,13 +256,14 @@ print_header "NetHunter Module Extractor"
 # --- Input Collection ---
 
 # Non-Interactive (Argument) Mode
-if [ "$#" -eq 5 ]; then
+if [ "$#" -eq 5 ] || [ "$#" -eq 6 ]; then
     log_info "Running in Non-Interactive Mode."
     NH_MODULE_DIR_RAW="$1"
     STAGING_DIR_RAW="$2"
     VENDOR_BOOT_LIST_RAW="$3"
     SYSTEM_MAP_RAW="$4"
     OUTPUT_DIR_RAW="$5"
+    STRIP_TOOL_RAW="${6:-}"  # Optional 6th argument
 
 # Interactive Mode
 elif [ "$#" -eq 0 ]; then
@@ -215,10 +276,11 @@ elif [ "$#" -eq 0 ]; then
     read -e -p "Enter path to vendor_boot.img's modules_list.txt: " VENDOR_BOOT_LIST_RAW
     read -e -p "Enter path to System.map file: " SYSTEM_MAP_RAW
     read -e -p "Enter output directory for organized modules: " OUTPUT_DIR_RAW
+    read -e -p "Enter path to strip tool (llvm-strip/aarch64-linux-gnu-strip) or press Enter to skip: " STRIP_TOOL_RAW
 
 # Invalid arguments
 else
-    log_error "Invalid number of arguments. Use 0 for interactive mode or 5 for non-interactive."
+    log_error "Invalid number of arguments. Use 0 for interactive mode or 5-6 for non-interactive."
     show_help
     exit 1
 fi
@@ -229,6 +291,7 @@ STAGING_DIR=$(sanitize_path "$STAGING_DIR_RAW")
 VENDOR_BOOT_LIST=$(sanitize_path "$VENDOR_BOOT_LIST_RAW")
 SYSTEM_MAP=$(sanitize_path "$SYSTEM_MAP_RAW")
 OUTPUT_DIR=$(sanitize_path "$OUTPUT_DIR_RAW")
+STRIP_TOOL=$(sanitize_path "$STRIP_TOOL_RAW")
 
 # Validate inputs
 if [ ! -d "$NH_MODULE_DIR" ]; then
@@ -255,6 +318,12 @@ fi
 if [ -z "$OUTPUT_DIR" ]; then
     OUTPUT_DIR="$(pwd)/nethunter_modules_extracted"
     log_info "Output directory not specified, using: $OUTPUT_DIR"
+fi
+
+# Validate strip tool if provided
+if [ -n "$STRIP_TOOL" ] && [ ! -x "$STRIP_TOOL" ]; then
+    log_warning "Strip tool not found or not executable: '$STRIP_TOOL'. Module stripping will be skipped."
+    STRIP_TOOL=""
 fi
 
 print_header "Initialization"
@@ -407,6 +476,24 @@ done
 log_info "Organized $VB_COUNT modules into vendor_boot"
 log_info "Organized $VD_COUNT modules into vendor_dlkm"
 
+# --- Module Stripping ---
+
+if [ -n "$STRIP_TOOL" ]; then
+    print_header "Stripping Modules"
+    
+    # Strip vendor_boot modules if any
+    if [ $VB_COUNT -gt 0 ]; then
+        strip_modules "$VB_MODULE_DIR" "$STRIP_TOOL"
+    fi
+    
+    # Strip vendor_dlkm modules if any
+    if [ $VD_COUNT -gt 0 ]; then
+        strip_modules "$VD_MODULE_DIR" "$STRIP_TOOL"
+    fi
+else
+    log_info "Strip tool not provided, skipping module stripping..."
+fi
+
 # --- Copy Build Files ---
 
 print_header "Preparing Build Environment"
@@ -500,6 +587,7 @@ echo "  - NetHunter modules found: $NH_COUNT"
 echo "  - Total modules processed: $TOTAL_MODULES"
 echo "  - vendor_boot modules: $VB_COUNT"
 echo "  - vendor_dlkm modules: $VD_COUNT"
+echo "  - Strip tool used: $([ -n "$STRIP_TOOL" ] && echo "$(basename "$STRIP_TOOL")" || echo "None")"
 echo "  - Output directory: $OUTPUT_DIR"
 echo ""
 
